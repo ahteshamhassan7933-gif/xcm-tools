@@ -37,6 +37,33 @@ const validateAmount = (amount: bigint, requiredFee: bigint): void => {
   }
 }
 
+const hasFeeShortfallUpToExchange = <TCustomChain extends string = never>(
+  { hops, destination }: TDryRunResult<TCustomChain>,
+  exchangeChain: TParachain,
+  destChain?: TChain
+) => {
+  const exchangeIndex = hops.findIndex(hop => hop.chain === exchangeChain)
+  const hopsUpToExchange = exchangeIndex === -1 ? hops : hops.slice(0, exchangeIndex + 1)
+  const results = [...hopsUpToExchange.map(hop => hop.result), ...(destChain ? [] : [destination])]
+  return results.some(
+    result =>
+      result?.success === false &&
+      ['NotHoldingFees', 'TooExpensive'].includes(result.dryRunError.reason)
+  )
+}
+
+const padByPriceImpact = async (
+  fee: bigint,
+  amountIn: bigint,
+  quoteNative: (amount: bigint) => Promise<bigint>
+) => {
+  const [feeOut, amountOut] = await Promise.all([quoteNative(fee), quoteNative(amountIn)])
+  if (amountOut === 0n) return fee
+  const ratio = amountIn * feeOut
+  const padded = (ratio * ratio) / (fee * amountOut * amountOut)
+  return padded > fee ? padded : fee
+}
+
 const calculateTotalFees = (chain: TSubstrateChain | undefined, fees: TSwapFeeEstimates): bigint =>
   chain ? fees.originReserveFee + fees.exchangeFee : 0n
 
@@ -322,9 +349,17 @@ export const handleSwapExecuteTransfer = async <
     tx: api.deserializeExtrinsics(initialCall)
   })
 
-  if (firstDryRunResult.dryRunError?.reason === 'NotHoldingFees') {
-    if (separateFeeAssetInfo) throw new DryRunFailedError(firstDryRunResult.dryRunError)
+  const { dryRunError } = firstDryRunResult
 
+  if (separateFeeAssetInfo && dryRunError?.reason === 'NotHoldingFees') {
+    throw new DryRunFailedError(dryRunError)
+  }
+
+  if (
+    !separateFeeAssetInfo &&
+    chain &&
+    hasFeeShortfallUpToExchange(firstDryRunResult, exchangeChain, destChain)
+  ) {
     throw new AmountTooLowError(
       `Asset amount is too low to cover the fees, please increase the amount.`
     )
@@ -351,6 +386,23 @@ export const handleSwapExecuteTransfer = async <
     // We set the exchange fee to non-zero value to prevent creating dummy tx
     extractedFees.exchangeFee = MIN_FEE
   }
+
+  const nativeAsset = api.findNativeAssetInfoOrThrow(exchangeChain)
+
+  if (
+    chain &&
+    destChain &&
+    !hasSeparateFeeAsset &&
+    exchangeChain.includes('AssetHub') &&
+    !isAssetEqual(assetFrom, nativeAsset)
+  ) {
+    extractedFees.exchangeFee = await padByPriceImpact(
+      extractedFees.exchangeFee,
+      assetFrom.amount - extractedFees.originReserveFee - extractedFees.exchangeFee,
+      amount => calculateMinAmountOut(amount, nativeAsset, '0')
+    )
+  }
+
   const totalFees = calculateTotalFees(chain, extractedFees)
 
   if (!hasSeparateFeeAsset) {

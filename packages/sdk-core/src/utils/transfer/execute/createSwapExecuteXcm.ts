@@ -29,7 +29,6 @@ export const createExchangeInstructions = async <
   TCustomChain extends string = never
 >(
   options: TCreateSwapXcmInternalOptions<TApi, TRes, TSigner, TCustomChain>,
-  assetFrom: TAsset,
   assetTo: TAsset,
   separateFeeAssetInfo?: TAssetInfo
 ) => {
@@ -51,47 +50,54 @@ export const createExchangeInstructions = async <
 
   const nativeAsset = api.findAssetInfoOrThrow(exchangeChain, { symbol: Native(nativeSymbol) })
 
-  if (!needsMultiHop) {
-    return [
-      {
-        ExchangeAsset: {
-          give: createAssetsFilter(assetFrom, version),
-          want: [assetTo],
-          maximal: hasSeparateFeeAsset
-        }
-      }
+  const isDummyRun = exchangeFee === 0n
+
+  const halveOnDummyFees = (amount: bigint) => (isDummyRun ? (amount + 1n) / 2n : amount)
+
+  const createWant = (asset: TAsset) => [isDummyRun ? { ...asset, fun: { Fungible: 1n } } : asset]
+
+  const amountIn =
+    BigInt(assetInfoFrom.amount) -
+    (chain && !hasSeparateFeeAsset ? originReserveFee + exchangeFee : 0n)
+
+  const give = {
+    Definite: [
+      createAsset(
+        version,
+        halveOnDummyFees(amountIn),
+        localizeLocation(exchangeChain, assetInfoFrom.location)
+      )
     ]
+  }
+
+  if (!needsMultiHop) {
+    return [{ ExchangeAsset: { give, want: createWant(assetTo), maximal: true } }]
   }
 
   // Multi-hop through native asset
 
+  const isNativeFeeAsset = hasSeparateFeeAsset && isAssetEqual(separateFeeAssetInfo, nativeAsset)
+
   const nativeAmountOut = await calculateMinAmountOut(
-    BigInt(assetInfoFrom.amount) -
-      (chain && !hasSeparateFeeAsset ? originReserveFee + exchangeFee : 0n),
-    nativeAsset
+    amountIn,
+    nativeAsset,
+    isNativeFeeAsset ? '0' : undefined
   )
 
   const assetNative = createAsset(
     version,
-    exchangeFee === 0n ? (nativeAmountOut + 1n) / 2n : nativeAmountOut,
+    halveOnDummyFees(nativeAmountOut),
     localizeLocation(exchangeChain, nativeAsset.location)
   )
 
   return [
+    { ExchangeAsset: { give, want: createWant(assetNative), maximal: true } },
     {
       ExchangeAsset: {
-        give: createAssetsFilter(assetFrom, version),
-        want: [assetNative],
-        maximal: hasSeparateFeeAsset
-      }
-    },
-    {
-      ExchangeAsset: {
-        give:
-          separateFeeAssetInfo && isAssetEqual(separateFeeAssetInfo, nativeAsset)
-            ? { Definite: [assetNative] }
-            : createAssetsFilter(assetNative, version),
-        want: [assetTo],
+        give: isNativeFeeAsset
+          ? { Definite: [assetNative] }
+          : createAssetsFilter(assetNative, version),
+        want: createWant(assetTo),
         maximal: true
       }
     }
@@ -127,12 +133,6 @@ export const createSwapExecuteXcm = async <
   const resolvedDestChain: TSubstrateChain | undefined = isEthereumDest
     ? `AssetHub${getRelayChainOf(chain ?? exchangeChain)}`
     : undefined
-
-  const assetFrom = createAsset(
-    version,
-    assetInfoFrom.amount,
-    localizeLocation(exchangeChain, assetInfoFrom.location)
-  )
 
   const amountOut = assetInfoTo.amount
 
@@ -221,7 +221,6 @@ export const createSwapExecuteXcm = async <
 
   const exchangeInstructions = await createExchangeInstructions(
     options,
-    assetFrom,
     assetTo,
     resolvedFeeAssetInfo
   )

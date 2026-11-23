@@ -136,7 +136,7 @@ describe('createSwapExecuteXcm', () => {
         ...PREPARED_XCM.prefix,
         expect.objectContaining({
           ExchangeAsset: {
-            maximal: false,
+            maximal: true,
             give: expect.any(Object),
             want: expect.any(Array)
           }
@@ -184,7 +184,7 @@ describe('createSwapExecuteXcm', () => {
       options.assetInfoFrom,
       options.assetInfoTo
     )
-    expect(calculateMinAmountOut).toHaveBeenCalledWith(1985n, ASSET_FROM)
+    expect(calculateMinAmountOut).toHaveBeenCalledWith(1985n, ASSET_FROM, undefined)
     expect(createBaseExecuteXcm).toHaveBeenCalledTimes(2)
     expect(createBaseExecuteXcm).toHaveBeenNthCalledWith(
       1,
@@ -448,7 +448,7 @@ describe('createSwapExecuteXcm', () => {
       )
 
       const { suffixXcm } = vi.mocked(createBaseExecuteXcm).mock.calls[1][0]
-      expect(suffixXcm?.[0]).toMatchObject({ ExchangeAsset: { maximal: false } })
+      expect(suffixXcm?.[0]).toMatchObject({ ExchangeAsset: { maximal: true } })
     })
     it('deposits the fee asset when its leftover reaches the final chain ED', async () => {
       vi.mocked(isAssetEqual).mockReturnValue(false)
@@ -561,57 +561,69 @@ describe('createSwapExecuteXcm', () => {
       vi.mocked(createAssetsFilter).mockReturnValue(ASSETS_FILTER)
     })
 
-    it('uses maximal: false without a separate fee asset', async () => {
+    it('sells exactly the amount left after hop fees for at least the min amount out', async () => {
       vi.mocked(isMultiHopSwap).mockReturnValue(false)
+      vi.mocked(localizeLocation).mockReturnValue(LOCATION)
+      vi.mocked(createAsset).mockReturnValue(ASSET)
 
-      const result = await createExchangeInstructions(baseOptions, ASSET, ASSET, undefined)
+      const result = await createExchangeInstructions(
+        { ...baseOptions, chain: 'Astar', fees: { ...baseOptions.fees, exchangeFee: 10n } },
+        ASSET,
+        undefined
+      )
 
-      expect(result[0]).toMatchObject({
-        ExchangeAsset: { maximal: false }
-      })
+      expect(createAsset).toHaveBeenCalledWith(Version.V3, 980n, LOCATION)
+      expect(result).toEqual([
+        { ExchangeAsset: { give: { Definite: [ASSET] }, want: [ASSET], maximal: true } }
+      ])
     })
 
-    it('uses maximal: true with a separate fee asset', async () => {
+    it('sells half of the amount for any amount out in the dummy fee dry run', async () => {
       vi.mocked(isMultiHopSwap).mockReturnValue(false)
+      vi.mocked(localizeLocation).mockReturnValue(LOCATION)
+      vi.mocked(createAsset).mockReturnValue(ASSET)
 
-      const result = await createExchangeInstructions(baseOptions, ASSET, ASSET, feeAssetInfo)
+      const result = await createExchangeInstructions(baseOptions, ASSET, undefined)
 
-      expect(result[0]).toMatchObject({
-        ExchangeAsset: { maximal: true }
-      })
+      expect(createAsset).toHaveBeenCalledWith(Version.V3, 500n, LOCATION)
+      expect(result).toEqual([
+        {
+          ExchangeAsset: {
+            give: { Definite: [ASSET] },
+            want: [{ ...ASSET, fun: { Fungible: 1n } }],
+            maximal: true
+          }
+        }
+      ])
     })
 
-    it('gives only the swapped native amount in the second hop when the fee asset is the native asset', async () => {
+    it('quotes the first hop without slippage and gives only the swapped native amount in the second hop when the fee asset is the native asset', async () => {
       vi.spyOn(api, 'findAssetInfoOrThrow').mockReturnValue(ASSET_FROM)
       vi.mocked(isMultiHopSwap).mockReturnValue(true)
       vi.mocked(localizeLocation).mockReturnValue(LOCATION)
       vi.mocked(createAsset).mockReturnValue(ASSET)
-      const options = createOptions({ api, calculateMinAmountOut: vi.fn().mockResolvedValue(400n) })
+      const calculateMinAmountOut = vi.fn().mockResolvedValue(400n)
+      const options = createOptions({ api, calculateMinAmountOut })
 
       vi.mocked(isAssetEqual).mockReturnValue(true)
-      const [firstHop, nativeFeeHop] = await createExchangeInstructions(
-        options,
-        ASSET,
-        ASSET,
-        ASSET_FROM
-      )
+      const [firstHop, nativeFeeHop] = await createExchangeInstructions(options, ASSET, ASSET_FROM)
 
       expect(isAssetEqual).toHaveBeenCalledWith(ASSET_FROM, ASSET_FROM)
-      expect(firstHop).toMatchObject({ ExchangeAsset: { maximal: true } })
+      expect(calculateMinAmountOut).toHaveBeenLastCalledWith(2000n, ASSET_FROM, '0')
+      expect(firstHop).toMatchObject({
+        ExchangeAsset: { give: { Definite: [ASSET] }, maximal: true }
+      })
       expect(nativeFeeHop).toMatchObject({
         ExchangeAsset: { give: { Definite: [ASSET] }, maximal: true }
       })
 
       vi.mocked(isAssetEqual).mockReturnValue(false)
-      const [, otherFeeHop] = await createExchangeInstructions(options, ASSET, ASSET, feeAssetInfo)
+      const [, otherFeeHop] = await createExchangeInstructions(options, ASSET, feeAssetInfo)
 
+      expect(calculateMinAmountOut).toHaveBeenLastCalledWith(2000n, ASSET_FROM, undefined)
       expect(otherFeeHop).toMatchObject({
         ExchangeAsset: { give: ASSETS_FILTER, maximal: true }
       })
-
-      const [plainFirstHop] = await createExchangeInstructions(options, ASSET, ASSET, undefined)
-
-      expect(plainFirstHop).toMatchObject({ ExchangeAsset: { maximal: false } })
     })
 
     it('does not subtract hop fees from the multi-hop amount when fees are paid separately', async () => {
@@ -634,11 +646,11 @@ describe('createSwapExecuteXcm', () => {
         }
       })
 
-      await createExchangeInstructions(options, ASSET, ASSET, feeAssetInfo)
-      expect(calculateMinAmountOut).toHaveBeenLastCalledWith(1000n, ASSET_FROM)
+      await createExchangeInstructions(options, ASSET, feeAssetInfo)
+      expect(calculateMinAmountOut).toHaveBeenLastCalledWith(1000n, ASSET_FROM, undefined)
 
-      await createExchangeInstructions(options, ASSET, ASSET, undefined)
-      expect(calculateMinAmountOut).toHaveBeenLastCalledWith(985n, ASSET_FROM)
+      await createExchangeInstructions(options, ASSET, undefined)
+      expect(calculateMinAmountOut).toHaveBeenLastCalledWith(985n, ASSET_FROM, undefined)
     })
   })
 })

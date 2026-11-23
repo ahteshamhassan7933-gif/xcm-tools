@@ -178,7 +178,9 @@ export const createBaseExecuteXcm = <TApi, TRes, TSigner, TCustomChain extends s
               feeAssetLocalizedToDest ??
                 updateAsset(
                   assetLocalizedToDest,
-                  reserveFee === 1000n ? amount / 2n : amount - originFeeDeduction - reserveFee
+                  reserveFee === 1000n && transferType !== 'DepositAsset'
+                    ? amount / 2n
+                    : amount - originFeeDeduction - reserveFee
                 )
             ),
             ...suffixXcm
